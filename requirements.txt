@@ -1,6 +1,11 @@
-streamlit>=1.37.0
-pandas>=2.2.2
-numpy>=1.26.4
-plotly>=5.22.0
-openpyxl>=3.1.5
-scipy>=1.14.0
+# App/runtime dependencies
+streamlit
+pandas
+numpy
+plotly
+openpyxl
+scipy
+
+# Developer/test dependencies
+pytest
+pytest-cov

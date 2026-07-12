@@ -1,0 +1,31 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Setup",
+            "type": "shell",
+            "command": "python -m pip install -r requirements.txt",
+            "problemMatcher": []
+        },
+        {
+            "label": "Build",
+            "type": "shell",
+            "command": "python -m compileall app.py src",
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Test",
+            "type": "shell",
+            "command": "pytest",
+            "group": "test",
+            "problemMatcher": []
+        },
+        {
+            "label": "Run Asset Alchemy",
+            "type": "shell",
+            "command": "python -m streamlit run app.py",
+            "problemMatcher": []
+        }
+    ]
+}

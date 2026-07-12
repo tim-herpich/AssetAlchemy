@@ -67,17 +67,56 @@ src/portfolio_analytics/
     design.py        # CSS and visual system
     formatting.py    # Display formatting helpers
 tests/
-  test_portfolio_tracker.py
+  unit/
+    test_asset_identity.py
+  e2e/
+    test_sample_analysis_pipeline.py
 ```
 
 ## Local Run
 
 ```bash
-pip install -r requirements.txt
-streamlit run app.py
+python -m pip install -r requirements.txt
+python -m streamlit run app.py
 ```
 
 Then open http://localhost:8501
+
+## Developer Workflow
+
+Setup:
+
+```bash
+conda activate portfolio-env
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Run app:
+
+```bash
+python -m streamlit run app.py
+```
+
+Build:
+
+```bash
+python -m compileall app.py src
+```
+
+Test:
+
+```bash
+pytest
+```
+
+VS Code:
+
+- Run task: `Run Asset Alchemy`
+- Run task: `Test`
+- F5 launch config: `Asset Alchemy Streamlit`
+
+GitHub Actions runs setup, build, and tests with coverage on pushes and pull requests.
 
 ## Hosting Options
 

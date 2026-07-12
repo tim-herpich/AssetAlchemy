@@ -6,3 +6,8 @@ __pycache__/
 .env
 .DS_Store
 .streamlit/secrets.toml
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+pytest-cache-files-*/

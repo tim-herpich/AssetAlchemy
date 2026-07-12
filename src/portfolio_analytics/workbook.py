@@ -118,10 +118,14 @@ def _asset_id_from_product(value) -> str:
     return _canonical(value)
 
 
-def make_asset_id(product, isin) -> str:
+def normalize_asset_id(isin: str | None, product: str | None) -> str:
     isin_text = _normalize_isin(isin)
     product_text = _asset_id_from_product(product)
     return isin_text or product_text
+
+
+def make_asset_id(product, isin) -> str:
+    return normalize_asset_id(isin, product)
 
 
 def _message(messages: list[ValidationMessage], severity: str, sheet: str, message: str, rows: Iterable[int] | None = None) -> None:

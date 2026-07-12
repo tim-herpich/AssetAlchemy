@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -20,6 +20,37 @@ class PortfolioWorkbook:
     composition: pd.DataFrame
     validation: list[ValidationMessage]
     workbook_sheets: list[str]
+    risk_free_rates: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(
+            columns=[
+                "year",
+                "country",
+                "yield_1y",
+                "yield_3y",
+                "yield_5y",
+                "yield_10y",
+                "yield_20y",
+                "yield_30y",
+            ]
+        )
+    )
+    daily_performance_reference: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(
+            columns=[
+                "date",
+                "portfolio_value_eur",
+                "total_investment_eur",
+                "total_fees_eur",
+                "cash_flow_eur",
+                "return_eur",
+                "total_return_eur",
+                "hpr",
+                "one_plus_hpr",
+                "twr",
+                "source_row",
+            ]
+        )
+    )
 
     @property
     def has_errors(self) -> bool:
@@ -50,10 +81,10 @@ class PortfolioAnalysis:
     fees_by_broker: pd.DataFrame
     fees_by_asset: pd.DataFrame
     metrics: dict[str, float]
+    reconciliation: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass(frozen=True)
 class AnalysisSettings:
-    annual_risk_free_rate: float = 0.0
     forward_fill_prices: bool = True
-
+    text_date_mode: str = "strict"

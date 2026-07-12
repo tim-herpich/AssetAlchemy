@@ -1,32 +1,33 @@
-# Portfolio Tracker (Streamlit)
+# Asset Alchemy
 
 A Streamlit portfolio-analysis app built around a strict three-sheet Excel template. It ingests transactions, historical prices, and target portfolio composition, then produces dynamic performance, risk, allocation, rebalancing, and export outputs for any number of positions.
 
 ## Features
 
-- Downloadable blank and sample Excel templates
-- Strict upload parsing for exactly three input sheets:
+- One downloadable prefilled Excel template with example data
+- Strict upload parsing for the three required input sheets:
   - Portfolio Composition
   - Historical Prices
   - Transactions
-- Dynamic asset detection from ISIN/Product values
+- Optional reconciliation against legacy `Daily Performance` workbook output
+- Dynamic asset detection with ISIN-first matching across transactions, historical prices, and portfolio composition
+- Intentional upload flow: workbooks are analyzed only after selecting **Analyze portfolio**
 - Multi-tab analysis UI:
-  - Upload & Validation
-  - Portfolio Overview
+  - Overview
   - Performance
   - Positions
-  - Allocation & Rebalancing
-  - Risk Metrics
-  - Rolling Analysis
+  - Allocation
+  - Risk
+  - Rolling
   - Transactions
-  - Historical Prices
+  - Data Quality
   - Export
 - Metrics include:
   - Portfolio value, invested capital, fees, and cash flows
   - Daily, annual, rolling, time-weighted, and money-weighted returns
   - Allocation drift and rebalance suggestions
   - Drawdown, volatility, VaR/CVaR, concentration, and diversification
-  - Sharpe and Sortino
+  - Sharpe, Sortino, and Calmar ratios, using government-bond risk-free rates parsed from the workbook when available
 - Interactive Plotly visuals:
   - Value vs invested curve
   - Drawdown curve
@@ -38,13 +39,17 @@ A Streamlit portfolio-analysis app built around a strict three-sheet Excel templ
 
 ## Input Expectations
 
-The required workbook contains exactly these input sheets:
+The required workbook contains these input sheets:
 
 1. `Portfolio Composition`
 2. `Historical Prices`
 3. `Transactions`
 
-Use the in-app template downloads for the exact structure. The Transactions sheet parses only columns A:J under `All Transactions`; Historical Prices use repeating `Product / ISIN / Date / Price` blocks; Portfolio Composition uses dynamic `Instrument / Target Weight in Portfolio` pairs plus a final tolerance column.
+Use the in-app template for the exact structure. The Transactions sheet parses only columns A:J under `All Transactions`; Historical Prices use repeating `Product / ISIN / Date / Price` blocks plus an optional `Risk-Free Government Bonds` yield block; Portfolio Composition uses dynamic `Instrument / ISIN / Target Weight in Portfolio` groups plus a final tolerance column.
+
+ISIN is the primary asset key when present. Product names are display labels and fallback matching keys, and the Data Quality panel flags mismatches such as the same ISIN with different product names or the same product with different ISINs.
+
+If an older workbook also contains a `Daily Performance` sheet, Asset Alchemy reads the latest cached row from columns A:J and shows a reconciliation table in Data Quality. Transaction dates stored as text are rejected in strict mode by default; permissive mode parses them day-first and keeps a warning.
 
 ## Project Structure
 
@@ -58,7 +63,7 @@ src/portfolio_analytics/
   charts.py          # Plotly chart builders
   exports.py         # CSV/XLSX export helpers
   ui/
-    app.py           # Streamlit pages and navigation
+    app.py           # Streamlit dashboard and state-driven upload flow
     design.py        # CSS and visual system
     formatting.py    # Display formatting helpers
 tests/

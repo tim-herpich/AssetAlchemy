@@ -171,11 +171,31 @@ def rolling_metric_chart(rolling: pd.DataFrame, metric: str, title: str) -> go.F
     data = rolling[rolling["period"] != "Since inception"].copy()
     if data.empty:
         return _empty_figure(title)
-    fig = px.line(data, x="period", y=metric, color="period_years", markers=True, template=PLOT_TEMPLATE, title=title, color_continuous_scale="Viridis")
+    data["period_years_label"] = data["period_years"].map(_format_period_years)
+    fig = px.line(
+        data,
+        x="period",
+        y=metric,
+        color="period_years_label",
+        markers=True,
+        template=PLOT_TEMPLATE,
+        title=title,
+        color_discrete_sequence=QUALITATIVE,
+        labels={"period_years_label": "Window"},
+    )
     fig.update_layout(height=340, margin=dict(l=16, r=16, t=48, b=16), legend=dict(orientation="h"))
     if "ratio" not in metric and "days" not in metric:
         fig.update_yaxes(tickformat=".1%")
     return fig
+
+
+def _format_period_years(value) -> str:
+    if pd.isna(value):
+        return "Unknown"
+    years = float(value)
+    if years.is_integer():
+        return f"{int(years)}Y"
+    return f"{years:.1f}Y"
 
 
 def correlation_heatmap(correlation: pd.DataFrame) -> go.Figure:

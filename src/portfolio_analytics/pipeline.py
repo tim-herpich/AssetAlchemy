@@ -8,7 +8,7 @@ from .workbook import parse_workbook
 
 
 def analyze_uploaded_workbook(file_bytes: bytes, settings: AnalysisSettings) -> tuple[PortfolioWorkbook, PortfolioAnalysis]:
-    workbook = parse_workbook(BytesIO(file_bytes))
+    workbook = parse_workbook(BytesIO(file_bytes), text_date_mode=settings.text_date_mode)
     analysis = build_analysis(
         workbook,
         forward_fill_prices=settings.forward_fill_prices,

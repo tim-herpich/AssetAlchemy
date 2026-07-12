@@ -5,12 +5,14 @@ import math
 import numpy as np
 import pandas as pd
 
-from .models import PortfolioAnalysis, PortfolioWorkbook
+from .models import PortfolioAnalysis, PortfolioWorkbook, ValidationMessage
 from .workbook import _canonical, _clean_text
 
 
 TRADING_DAYS = 252
 PORTFOLIO_ID = "PORTFOLIO"
+RECONCILIATION_MONEY_TOLERANCE = 1.0
+RECONCILIATION_RETURN_TOLERANCE = 0.0001
 
 
 def build_analysis(
@@ -51,6 +53,11 @@ def build_analysis(
     rolling = add_rolling_allocation_context(
         rolling, daily_asset, daily_portfolio, composition, asset_master
     )
+    reconciliation = reconcile_daily_performance(
+        getattr(workbook, "daily_performance_reference", pd.DataFrame()),
+        daily_portfolio,
+    )
+    _append_reconciliation_status(workbook, reconciliation)
 
     return PortfolioAnalysis(
         asset_master=asset_master,
@@ -68,6 +75,7 @@ def build_analysis(
         fees_by_broker=fees_by_broker,
         fees_by_asset=fees_by_asset,
         metrics=metrics,
+        reconciliation=reconciliation,
     )
 
 
@@ -103,7 +111,7 @@ def build_asset_master(transactions: pd.DataFrame, prices: pd.DataFrame, composi
                 {
                     "asset_id": asset_id,
                     "product": _first_non_empty(group["product"]),
-                    "isin": "",
+                    "isin": _first_non_empty(group["isin"]) if "isin" in group.columns else "",
                     "has_transactions": False,
                     "has_prices": False,
                     "has_target": True,
@@ -136,17 +144,27 @@ def map_composition_assets(composition: pd.DataFrame, asset_master: pd.DataFrame
         return mapped
 
     by_asset = {row.asset_id: row.asset_id for row in asset_master.itertuples()}
-    by_isin = {str(row.isin).upper(): row.asset_id for row in asset_master.itertuples() if _clean_text(row.isin)}
-    by_product = {_canonical(row.product): row.asset_id for row in asset_master.itertuples() if _clean_text(row.product)}
+    by_isin: dict[str, str] = {}
+    by_product: dict[str, str] = {}
+    master_rows = list(asset_master.itertuples())
+    preferred_rows = [row for row in master_rows if bool(row.has_transactions) or bool(row.has_prices)]
+    fallback_rows = [row for row in master_rows if not (bool(row.has_transactions) or bool(row.has_prices))]
+    for row in preferred_rows + fallback_rows:
+        if _clean_text(row.isin):
+            by_isin.setdefault(str(row.isin).upper(), row.asset_id)
+        if _clean_text(row.product):
+            by_product.setdefault(_canonical(row.product), row.asset_id)
 
     def choose_asset(row) -> str:
         raw = _clean_text(row["asset_id"])
+        isin = _clean_text(row["isin"]) if "isin" in row else ""
         product = _clean_text(row["product"])
         return (
-            by_asset.get(raw)
+            by_isin.get(isin.upper())
             or by_isin.get(raw.upper())
             or by_product.get(_canonical(product))
             or by_product.get(_canonical(raw))
+            or by_asset.get(raw)
             or raw
         )
 
@@ -864,6 +882,107 @@ def build_summary_metrics(
         "worst_month": worst_month,
         "positions": float((holdings["value_eur"] > 0).sum()) if not holdings.empty else 0.0,
     }
+
+
+def reconcile_daily_performance(reference: pd.DataFrame, daily_portfolio: pd.DataFrame) -> pd.DataFrame:
+    columns = ["Metric", "Workbook value", "App value", "Difference", "Status"]
+    if reference is None or reference.empty or daily_portfolio.empty:
+        return pd.DataFrame(columns=columns)
+
+    ref = reference.sort_values(["date", "source_row"]).tail(1).iloc[0]
+    ref_date = pd.Timestamp(ref["date"]).normalize() if pd.notna(ref.get("date")) else pd.NaT
+    app_rows = daily_portfolio[daily_portfolio["date"].eq(ref_date)] if pd.notna(ref_date) else pd.DataFrame()
+    if app_rows.empty:
+        app_row = daily_portfolio.tail(1).iloc[0]
+    else:
+        app_row = app_rows.tail(1).iloc[0]
+
+    metric_map = [
+        ("Date", "date", "date", "date"),
+        ("Portfolio Value in EUR", "portfolio_value_eur", "value_eur", "money"),
+        ("Total Investment in EUR", "total_investment_eur", "total_investment_eur", "money"),
+        ("Total Fees in EUR", "total_fees_eur", "total_fees_eur", "money"),
+        ("Cash Flow in EUR", "cash_flow_eur", "cash_flow_eur", "money"),
+        ("Return in EUR", "return_eur", "return_eur", "money"),
+        ("Total Return in EUR", "total_return_eur", "total_return_eur", "money"),
+        ("HPR", "hpr", "hpr", "return"),
+        ("1+HPR", "one_plus_hpr", "one_plus_hpr", "return"),
+        ("TWR", "twr", "twr", "return"),
+    ]
+
+    rows: list[dict[str, object]] = []
+    for metric, ref_col, app_col, kind in metric_map:
+        workbook_value = ref.get(ref_col, np.nan)
+        app_value = app_row.get(app_col, np.nan)
+        if kind == "date":
+            workbook_date = pd.Timestamp(workbook_value).normalize() if pd.notna(workbook_value) else pd.NaT
+            app_date = pd.Timestamp(app_value).normalize() if pd.notna(app_value) else pd.NaT
+            if pd.isna(workbook_date) or pd.isna(app_date):
+                difference = np.nan
+                status = "Missing"
+            else:
+                difference = int((app_date - workbook_date).days)
+                status = "Match" if difference == 0 else "Mismatch"
+            rows.append(
+                {
+                    "Metric": metric,
+                    "Workbook value": workbook_date.date() if pd.notna(workbook_date) else np.nan,
+                    "App value": app_date.date() if pd.notna(app_date) else np.nan,
+                    "Difference": difference,
+                    "Status": status,
+                }
+            )
+            continue
+
+        workbook_number = pd.to_numeric(workbook_value, errors="coerce")
+        app_number = pd.to_numeric(app_value, errors="coerce")
+        if pd.isna(workbook_number) or pd.isna(app_number):
+            difference = np.nan
+            status = "Missing"
+        else:
+            difference = float(app_number) - float(workbook_number)
+            tolerance = RECONCILIATION_MONEY_TOLERANCE if kind == "money" else RECONCILIATION_RETURN_TOLERANCE
+            status = "Match" if abs(difference) <= tolerance else "Mismatch"
+        rows.append(
+            {
+                "Metric": metric,
+                "Workbook value": float(workbook_number) if pd.notna(workbook_number) else np.nan,
+                "App value": float(app_number) if pd.notna(app_number) else np.nan,
+                "Difference": difference,
+                "Status": status,
+            }
+        )
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _append_reconciliation_status(workbook: PortfolioWorkbook, reconciliation: pd.DataFrame) -> None:
+    if reconciliation.empty:
+        return
+    statuses = set(reconciliation["Status"].dropna())
+    if statuses - {"Match"}:
+        _append_validation_once(
+            workbook,
+            "Warning",
+            "Daily Performance",
+            "App output does not match workbook Daily Performance. Check date parsing, asset matching, and transaction validation.",
+        )
+    else:
+        _append_validation_once(
+            workbook,
+            "Info",
+            "Daily Performance",
+            "App output matches workbook Daily Performance within reconciliation tolerance.",
+        )
+
+
+def _append_validation_once(workbook: PortfolioWorkbook, severity: str, sheet: str, message: str) -> None:
+    if any(
+        existing.severity == severity and existing.sheet == sheet and existing.message == message
+        for existing in workbook.validation
+    ):
+        return
+    workbook.validation.append(ValidationMessage(severity=severity, sheet=sheet, message=message))
 
 
 def xirr_from_transactions(transactions: pd.DataFrame, terminal_value: float, terminal_date: pd.Timestamp) -> float:

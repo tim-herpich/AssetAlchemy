@@ -34,6 +34,23 @@ class PortfolioWorkbook:
             ]
         )
     )
+    daily_performance_reference: pd.DataFrame = field(
+        default_factory=lambda: pd.DataFrame(
+            columns=[
+                "date",
+                "portfolio_value_eur",
+                "total_investment_eur",
+                "total_fees_eur",
+                "cash_flow_eur",
+                "return_eur",
+                "total_return_eur",
+                "hpr",
+                "one_plus_hpr",
+                "twr",
+                "source_row",
+            ]
+        )
+    )
 
     @property
     def has_errors(self) -> bool:
@@ -64,8 +81,10 @@ class PortfolioAnalysis:
     fees_by_broker: pd.DataFrame
     fees_by_asset: pd.DataFrame
     metrics: dict[str, float]
+    reconciliation: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass(frozen=True)
 class AnalysisSettings:
     forward_fill_prices: bool = True
+    text_date_mode: str = "strict"

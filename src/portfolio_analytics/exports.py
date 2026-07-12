@@ -28,6 +28,7 @@ def build_analysis_workbook_bytes(workbook: PortfolioWorkbook, analysis: Portfol
         "Portfolio Composition": workbook.composition,
         "Historical Prices": workbook.prices,
         "Risk-Free Rates": workbook.risk_free_rates,
+        "Workbook Daily Performance": workbook.daily_performance_reference,
         "Transactions": workbook.transactions,
         "Daily Portfolio": analysis.daily_portfolio,
         "Daily Positions": analysis.daily_asset,
@@ -35,6 +36,7 @@ def build_analysis_workbook_bytes(workbook: PortfolioWorkbook, analysis: Portfol
         "Rolling Performance": analysis.rolling,
         "Allocation Analysis": analysis.allocation,
         "Risk By Asset": analysis.risk_by_asset,
+        "Reconciliation": analysis.reconciliation,
         "Validation Report": workbook.validation_frame(),
     }
     with pd.ExcelWriter(output, engine="openpyxl") as writer:

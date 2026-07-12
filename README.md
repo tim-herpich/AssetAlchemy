@@ -5,11 +5,12 @@ A Streamlit portfolio-analysis app built around a strict three-sheet Excel templ
 ## Features
 
 - One downloadable prefilled Excel template with example data
-- Strict upload parsing for exactly three input sheets:
+- Strict upload parsing for the three required input sheets:
   - Portfolio Composition
   - Historical Prices
   - Transactions
-- Dynamic asset detection from ISIN/Product values
+- Optional reconciliation against legacy `Daily Performance` workbook output
+- Dynamic asset detection with ISIN-first matching across transactions, historical prices, and portfolio composition
 - Intentional upload flow: workbooks are analyzed only after selecting **Analyze portfolio**
 - Multi-tab analysis UI:
   - Overview
@@ -38,13 +39,17 @@ A Streamlit portfolio-analysis app built around a strict three-sheet Excel templ
 
 ## Input Expectations
 
-The required workbook contains exactly these input sheets:
+The required workbook contains these input sheets:
 
 1. `Portfolio Composition`
 2. `Historical Prices`
 3. `Transactions`
 
-Use the in-app template for the exact structure. The Transactions sheet parses only columns A:J under `All Transactions`; Historical Prices use repeating `Product / ISIN / Date / Price` blocks plus an optional `Risk-Free Government Bonds` yield block; Portfolio Composition uses dynamic `Instrument / Target Weight in Portfolio` pairs plus a final tolerance column.
+Use the in-app template for the exact structure. The Transactions sheet parses only columns A:J under `All Transactions`; Historical Prices use repeating `Product / ISIN / Date / Price` blocks plus an optional `Risk-Free Government Bonds` yield block; Portfolio Composition uses dynamic `Instrument / ISIN / Target Weight in Portfolio` groups plus a final tolerance column.
+
+ISIN is the primary asset key when present. Product names are display labels and fallback matching keys, and the Data Quality panel flags mismatches such as the same ISIN with different product names or the same product with different ISINs.
+
+If an older workbook also contains a `Daily Performance` sheet, Asset Alchemy reads the latest cached row from columns A:J and shows a reconciliation table in Data Quality. Transaction dates stored as text are rejected in strict mode by default; permissive mode parses them day-first and keeps a warning.
 
 ## Project Structure
 

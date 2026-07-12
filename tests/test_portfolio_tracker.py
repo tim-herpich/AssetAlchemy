@@ -12,7 +12,11 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from portfolio_analytics.engine import build_analysis, build_rolling_performance
+from portfolio_analytics.engine import (
+    build_analysis,
+    build_rolling_performance,
+    risk_free_rate_for_period,
+)
 from portfolio_analytics.models import PortfolioWorkbook
 from portfolio_analytics.workbook import (
     REQUIRED_SHEETS,
@@ -45,6 +49,37 @@ def test_sample_template_parses_and_builds_dynamic_analysis():
     assert analysis.daily_portfolio.iloc[0]["is_baseline"]
     assert analysis.daily_portfolio.iloc[0]["value_eur"] == 0
     assert analysis.allocation["target_weight"].sum() > 0
+
+
+def test_risk_free_block_is_parsed_and_used_for_annual_metrics():
+    parsed = parse_workbook(BytesIO(build_upload_template_bytes(include_examples=True)))
+    analysis = build_analysis(parsed)
+
+    assert not parsed.risk_free_rates.empty
+    assert list(parsed.risk_free_rates.columns) == [
+        "year",
+        "country",
+        "yield_1y",
+        "yield_3y",
+        "yield_5y",
+        "yield_10y",
+        "yield_20y",
+        "yield_30y",
+    ]
+    metric_2019 = analysis.annual.loc[analysis.annual["year"].eq(2019)].iloc[0]
+    assert metric_2019["risk_free_rate"] == -0.0062
+    assert "No risk-free-rate block found" not in " ".join(
+        message.message for message in parsed.validation
+    )
+
+
+def test_risk_free_tie_breaks_prefer_the_next_longer_maturity():
+    rates = pd.DataFrame(
+        [{"year": 2024, "yield_1y": 0.01, "yield_3y": 0.03, "yield_5y": 0.05}]
+    )
+
+    assert risk_free_rate_for_period(rates, 2, 2024) == 0.03
+    assert risk_free_rate_for_period(rates, 4, 2024) == 0.05
 
 
 def test_transfer_is_preserved_but_ignored_for_quantity():

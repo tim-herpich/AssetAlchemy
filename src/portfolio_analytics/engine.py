@@ -21,20 +21,36 @@ def build_analysis(
     transactions = workbook.transactions.copy()
     prices = workbook.prices.copy()
     composition = workbook.composition.copy()
+    risk_free_rates = getattr(workbook, "risk_free_rates", pd.DataFrame()).copy()
 
     asset_master = build_asset_master(transactions, prices, composition)
     composition = map_composition_assets(composition, asset_master)
     daily_asset, daily_portfolio = build_daily_performance(transactions, prices, asset_master, forward_fill_prices)
-    annual = build_annual_performance(daily_portfolio, annual_risk_free_rate)
-    rolling = build_rolling_performance(daily_portfolio, annual_risk_free_rate)
+    annual = build_annual_performance(
+        daily_portfolio, annual_risk_free_rate, risk_free_rates
+    )
+    rolling = build_rolling_performance(
+        daily_portfolio, annual_risk_free_rate, risk_free_rates
+    )
     holdings = build_holdings_snapshot(daily_asset, asset_master)
     allocation = build_allocation(daily_asset, daily_portfolio, composition, asset_master)
     monthly_returns = build_monthly_returns(daily_portfolio)
     correlation = build_correlation(prices)
-    risk_by_asset = build_asset_risk(daily_asset, annual_risk_free_rate)
+    risk_by_asset = build_asset_risk(
+        daily_asset, annual_risk_free_rate, risk_free_rates
+    )
     diversification = build_diversification_metrics(allocation, correlation)
     transaction_summary, fees_by_broker, fees_by_asset = build_transaction_analytics(transactions)
-    metrics = build_summary_metrics(daily_portfolio, holdings, transactions, annual_risk_free_rate)
+    metrics = build_summary_metrics(
+        daily_portfolio,
+        holdings,
+        transactions,
+        annual_risk_free_rate,
+        risk_free_rates,
+    )
+    rolling = add_rolling_allocation_context(
+        rolling, daily_asset, daily_portfolio, composition, asset_master
+    )
 
     return PortfolioAnalysis(
         asset_master=asset_master,
@@ -336,17 +352,37 @@ def build_holdings_snapshot(daily_asset: pd.DataFrame, asset_master: pd.DataFram
     return holdings
 
 
-def build_annual_performance(daily_portfolio: pd.DataFrame, annual_risk_free_rate: float) -> pd.DataFrame:
+def build_annual_performance(
+    daily_portfolio: pd.DataFrame,
+    annual_risk_free_rate: float = 0.0,
+    risk_free_rates: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if daily_portfolio.empty:
         return pd.DataFrame()
     years = sorted(daily_portfolio["date"].dt.year.unique())
     rows = []
     for year in years:
-        rows.append(_period_metrics(daily_portfolio, pd.Timestamp(year=year, month=1, day=1), pd.Timestamp(year=year, month=12, day=31), 1.0, annual_risk_free_rate, year=year))
+        rate = risk_free_rate_for_period(
+            risk_free_rates, 1.0, int(year), annual_risk_free_rate
+        )
+        rows.append(
+            _period_metrics(
+                daily_portfolio,
+                pd.Timestamp(year=year, month=1, day=1),
+                pd.Timestamp(year=year, month=12, day=31),
+                1.0,
+                rate,
+                year=year,
+            )
+        )
     return pd.DataFrame(rows)
 
 
-def build_rolling_performance(daily_portfolio: pd.DataFrame, annual_risk_free_rate: float) -> pd.DataFrame:
+def build_rolling_performance(
+    daily_portfolio: pd.DataFrame,
+    annual_risk_free_rate: float = 0.0,
+    risk_free_rates: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if daily_portfolio.empty:
         return pd.DataFrame()
     years = sorted(daily_portfolio["date"].dt.year.unique())
@@ -355,7 +391,9 @@ def build_rolling_performance(daily_portfolio: pd.DataFrame, annual_risk_free_ra
     rows = []
     min_year = int(min(years))
     max_year = int(max(years))
-    for period_years in [1, 2, 3, 4, 5, 10]:
+    # Every supported calendar-year window is useful: limiting the output to
+    # a hand-picked set (for example only 3Y and 5Y) hides valid history.
+    for period_years in range(1, max_year - min_year + 2):
         if max_year - min_year + 1 < period_years:
             continue
         for start_year in range(min_year, max_year - period_years + 2):
@@ -372,7 +410,12 @@ def build_rolling_performance(daily_portfolio: pd.DataFrame, annual_risk_free_ra
                 pd.Timestamp(year=start_year, month=1, day=1),
                 pd.Timestamp(year=end_year, month=12, day=31),
                 float(period_years),
-                annual_risk_free_rate,
+                risk_free_rate_for_period(
+                    risk_free_rates,
+                    float(period_years),
+                    end_year,
+                    annual_risk_free_rate,
+                ),
             )
             metrics.update(
                 {
@@ -388,7 +431,15 @@ def build_rolling_performance(daily_portfolio: pd.DataFrame, annual_risk_free_ra
     first_date = daily_portfolio["date"].min()
     last_date = daily_portfolio["date"].max()
     elapsed_years = max((last_date - first_date).days / 365.25, 1 / TRADING_DAYS)
-    metrics = _period_metrics(daily_portfolio, first_date, last_date, elapsed_years, annual_risk_free_rate)
+    metrics = _period_metrics(
+        daily_portfolio,
+        first_date,
+        last_date,
+        elapsed_years,
+        risk_free_rate_for_period(
+            risk_free_rates, elapsed_years, int(last_date.year), annual_risk_free_rate
+        ),
+    )
     metrics.update(
         {
             "period_years": elapsed_years,
@@ -443,6 +494,7 @@ def _period_metrics(
         "twr": period_twr,
         "annualized_return": annualized_twr,
         "annualized_twr": annualized_twr,
+        "risk_free_rate": annual_risk_free_rate,
         "period_volatility": period_volatility,
         "annualized_volatility": annualized_volatility,
         "downside_volatility": downside_volatility,
@@ -472,6 +524,104 @@ def _period_fee_change(daily_portfolio: pd.DataFrame, rows: pd.DataFrame, start_
     start_fees = float(prior["total_fees_eur"].iloc[0]) if not prior.empty else 0.0
     end_fees = float(rows["total_fees_eur"].iloc[-1])
     return end_fees - start_fees
+
+
+def risk_free_rate_for_period(
+    risk_free_rates: pd.DataFrame | None,
+    period_years: float,
+    end_year: int,
+    fallback: float = 0.0,
+) -> float:
+    """Select the closest available government-bond maturity for a period."""
+    if risk_free_rates is None or risk_free_rates.empty:
+        return float(fallback)
+    maturity_columns = {
+        1: "yield_1y",
+        3: "yield_3y",
+        5: "yield_5y",
+        10: "yield_10y",
+        20: "yield_20y",
+        30: "yield_30y",
+    }
+    available_columns = [
+        (maturity, column)
+        for maturity, column in maturity_columns.items()
+        if column in risk_free_rates.columns and risk_free_rates[column].notna().any()
+    ]
+    if not available_columns:
+        return float(fallback)
+    _, selected_column = min(
+        # On an exact-distance tie, use the longer maturity: 2Y therefore
+        # selects 3Y and 4Y selects 5Y, matching the workbook convention.
+        available_columns,
+        key=lambda item: (abs(item[0] - float(period_years)), -item[0]),
+    )
+    rates = risk_free_rates.copy()
+    if "year" not in rates.columns:
+        return float(fallback)
+    rates["year"] = pd.to_numeric(rates["year"], errors="coerce")
+    rates = rates.dropna(subset=["year", selected_column])
+    if rates.empty:
+        return float(fallback)
+    exact = rates[rates["year"].eq(end_year)]
+    if exact.empty:
+        earlier = rates[rates["year"] <= end_year]
+        if not earlier.empty:
+            exact = earlier[earlier["year"].eq(earlier["year"].max())]
+        else:
+            closest_index = rates["year"].sub(end_year).abs().idxmin()
+            exact = rates.loc[[closest_index]]
+    value = pd.to_numeric(exact[selected_column], errors="coerce").median()
+    return float(value) if pd.notna(value) else float(fallback)
+
+
+def add_rolling_allocation_context(
+    rolling: pd.DataFrame,
+    daily_asset: pd.DataFrame,
+    daily_portfolio: pd.DataFrame,
+    composition: pd.DataFrame,
+    asset_master: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach endpoint weights and maximum target drift to each rolling row."""
+    if rolling.empty:
+        return rolling
+    result = rolling.copy()
+    weights: list[str] = []
+    drifts: list[float] = []
+    for row in result.itertuples():
+        period_end = daily_portfolio[
+            daily_portfolio["date"].dt.year.le(int(row.end_year))
+        ]["date"]
+        if period_end.empty:
+            weights.append("")
+            drifts.append(np.nan)
+            continue
+        allocation = build_allocation(
+            daily_asset,
+            daily_portfolio,
+            composition,
+            asset_master,
+            selected_date=period_end.max(),
+        )
+        if allocation.empty:
+            weights.append("")
+            drifts.append(np.nan)
+            continue
+        weights.append(
+            " | ".join(
+                f"{item.product}: {item.actual_weight:.1%}"
+                for item in allocation.itertuples()
+                if item.actual_weight > 0
+            )
+        )
+        drifts.append(
+            float(allocation["absolute_drift"].max())
+            if not composition.empty
+            else np.nan
+        )
+    result["end_allocation_weights"] = weights
+    result["allocation_drift"] = drifts
+    return result
 
 
 def build_allocation(
@@ -564,7 +714,11 @@ def build_correlation(prices: pd.DataFrame) -> pd.DataFrame:
     return returns.corr()
 
 
-def build_asset_risk(daily_asset: pd.DataFrame, annual_risk_free_rate: float) -> pd.DataFrame:
+def build_asset_risk(
+    daily_asset: pd.DataFrame,
+    annual_risk_free_rate: float = 0.0,
+    risk_free_rates: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if daily_asset.empty:
         return pd.DataFrame()
     rows = []
@@ -577,6 +731,12 @@ def build_asset_risk(daily_asset: pd.DataFrame, annual_risk_free_rate: float) ->
         annualized_return = _annualize_return(twr, elapsed_years)
         vol = float(returns.std(ddof=1) * math.sqrt(TRADING_DAYS)) if len(returns) > 1 else np.nan
         drawdown = _max_drawdown_from_values(group["value_eur"])
+        risk_free_rate = risk_free_rate_for_period(
+            risk_free_rates,
+            elapsed_years,
+            int(group["date"].max().year),
+            annual_risk_free_rate,
+        )
         rows.append(
             {
                 "asset_id": asset_id,
@@ -584,7 +744,8 @@ def build_asset_risk(daily_asset: pd.DataFrame, annual_risk_free_rate: float) ->
                 "twr": twr,
                 "annualized_return": annualized_return,
                 "annualized_volatility": vol,
-                "sharpe_ratio": _safe_ratio(annualized_return - annual_risk_free_rate, vol),
+                "risk_free_rate": risk_free_rate,
+                "sharpe_ratio": _safe_ratio(annualized_return - risk_free_rate, vol),
                 "max_drawdown": drawdown,
                 "current_weight": float(group["weight"].iloc[-1]),
                 "current_value_eur": float(group["value_eur"].iloc[-1]),
@@ -647,7 +808,8 @@ def build_summary_metrics(
     daily_portfolio: pd.DataFrame,
     holdings: pd.DataFrame,
     transactions: pd.DataFrame,
-    annual_risk_free_rate: float,
+    annual_risk_free_rate: float = 0.0,
+    risk_free_rates: pd.DataFrame | None = None,
 ) -> dict[str, float]:
     if daily_portfolio.empty:
         return {}
@@ -665,19 +827,29 @@ def build_summary_metrics(
     var_95 = float(np.percentile(returns, 5)) if len(returns) >= 20 else np.nan
     cvar_95 = float(returns[returns <= var_95].mean()) if pd.notna(var_95) else np.nan
     best_month, worst_month = _best_worst_month(daily_portfolio)
+    risk_free_rate = risk_free_rate_for_period(
+        risk_free_rates,
+        elapsed_years,
+        int(daily_portfolio["date"].max().year),
+        annual_risk_free_rate,
+    )
+    total_invested = float(latest["total_investment_eur"])
+    total_return = float(latest["value_eur"] - total_invested)
     return {
         "portfolio_value_eur": float(latest["value_eur"]),
-        "total_invested_eur": float(latest["total_investment_eur"]),
+        "total_invested_eur": total_invested,
         "net_contributions_eur": float(daily_portfolio["cash_flow_eur"].sum()),
         "total_fees_eur": float(latest["total_fees_eur"]),
-        "total_return_eur": float(latest["value_eur"] - latest["total_investment_eur"]),
+        "total_return_eur": total_return,
+        "total_return_pct": _safe_ratio(total_return, total_invested),
         "twr": twr,
         "money_weighted_return": money_weighted,
         "annualized_return": annualized_return,
         "annualized_volatility": annualized_volatility,
         "downside_volatility": downside_volatility,
-        "sharpe_ratio": _safe_ratio(annualized_return - annual_risk_free_rate, annualized_volatility),
-        "sortino_ratio": _safe_ratio(annualized_return - annual_risk_free_rate, downside_volatility),
+        "risk_free_rate": risk_free_rate,
+        "sharpe_ratio": _safe_ratio(annualized_return - risk_free_rate, annualized_volatility),
+        "sortino_ratio": _safe_ratio(annualized_return - risk_free_rate, downside_volatility),
         "calmar_ratio": _safe_ratio(annualized_return, abs(max_drawdown)),
         "max_drawdown": max_drawdown,
         "current_drawdown": current_drawdown,

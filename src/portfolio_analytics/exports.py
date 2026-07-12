@@ -12,11 +12,22 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
+def to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Export") -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=_safe_sheet_name(sheet_name))
+        worksheet = writer.book[_safe_sheet_name(sheet_name)]
+        worksheet.freeze_panes = "A2"
+    output.seek(0)
+    return output.getvalue()
+
+
 def build_analysis_workbook_bytes(workbook: PortfolioWorkbook, analysis: PortfolioAnalysis) -> bytes:
     output = BytesIO()
     sheets = {
         "Portfolio Composition": workbook.composition,
         "Historical Prices": workbook.prices,
+        "Risk-Free Rates": workbook.risk_free_rates,
         "Transactions": workbook.transactions,
         "Daily Portfolio": analysis.daily_portfolio,
         "Daily Positions": analysis.daily_asset,

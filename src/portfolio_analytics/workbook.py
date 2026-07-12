@@ -48,6 +48,27 @@ TRANSACTION_COLUMNS = [
     "fee_eur",
 ]
 PRICE_HEADERS = ["Product", "ISIN", "Date", "Price"]
+RISK_FREE_GROUP_HEADER = "Risk-Free Government Bonds"
+RISK_FREE_EXCEL_HEADERS = [
+    "Year",
+    "Country",
+    "1Y-Yield",
+    "3Y-Yield",
+    "5Y-Yield",
+    "10Y-Yield",
+    "20Y-Yield",
+    "30Y-Yield",
+]
+RISK_FREE_COLUMNS = [
+    "year",
+    "country",
+    "yield_1y",
+    "yield_3y",
+    "yield_5y",
+    "yield_10y",
+    "yield_20y",
+    "yield_30y",
+]
 COMPOSITION_TARGET_HEADER = "Target Weight in Portfolio"
 COMPOSITION_TOLERANCE_HEADER = "Weight Deviation Tolerance"
 SUPPORTED_ACTIONS = {"Buy", "Sell", "Transfer"}
@@ -153,6 +174,11 @@ def parse_workbook(file_obj) -> PortfolioWorkbook:
         if SHEET_HISTORICAL_PRICES in raw_sheets
         else _empty_prices()
     )
+    risk_free_rates = (
+        _parse_risk_free_rates(raw_sheets[SHEET_HISTORICAL_PRICES], messages)
+        if SHEET_HISTORICAL_PRICES in raw_sheets
+        else _empty_risk_free_rates()
+    )
     composition = (
         _parse_composition(raw_sheets[SHEET_PORTFOLIO_COMPOSITION], messages)
         if SHEET_PORTFOLIO_COMPOSITION in raw_sheets
@@ -167,6 +193,7 @@ def parse_workbook(file_obj) -> PortfolioWorkbook:
         composition=composition,
         validation=messages,
         workbook_sheets=xls.sheet_names,
+        risk_free_rates=risk_free_rates,
     )
 
 
@@ -191,6 +218,10 @@ def _empty_transactions() -> pd.DataFrame:
 
 def _empty_prices() -> pd.DataFrame:
     return pd.DataFrame(columns=["product", "isin", "asset_id", "date", "price", "source_row", "block"])
+
+
+def _empty_risk_free_rates() -> pd.DataFrame:
+    return pd.DataFrame(columns=RISK_FREE_COLUMNS)
 
 
 def _empty_composition() -> pd.DataFrame:
@@ -280,29 +311,15 @@ def _parse_prices(raw: pd.DataFrame, messages: list[ValidationMessage]) -> pd.Da
         return _empty_prices()
 
     header_row = [_clean_text(v) for v in raw.iloc[1].tolist()]
-    block_starts: list[int] = []
-    col = 0
-    while col + 3 < len(header_row):
-        headers = header_row[col : col + 4]
-        if headers == PRICE_HEADERS:
-            block_starts.append(col)
-            spacer_col = col + 4
-            if spacer_col < len(header_row) and _clean_text(raw.iat[1, spacer_col]):
-                _message(messages, "Warning", sheet, f"Expected a blank spacer column after price block starting at {get_column_letter(col + 1)}.")
-            col += 5
-            continue
-        if all(not _clean_text(v) for v in header_row[col:]):
-            break
-        next_match = None
-        for idx in range(col + 1, max(col + 2, len(header_row) - 3)):
-            if header_row[idx : idx + 4] == PRICE_HEADERS:
-                next_match = idx
-                break
-        if next_match is None:
-            _message(messages, "Warning", sheet, f"Unused or invalid price columns begin near {get_column_letter(col + 1)}.")
-            break
-        _message(messages, "Warning", sheet, f"Skipped unexpected columns before price block at {get_column_letter(next_match + 1)}.")
-        col = next_match
+    block_starts = [
+        col
+        for col in range(max(0, len(header_row) - len(PRICE_HEADERS) + 1))
+        if header_row[col : col + len(PRICE_HEADERS)] == PRICE_HEADERS
+    ]
+    for col in block_starts:
+        spacer_col = col + len(PRICE_HEADERS)
+        if spacer_col < len(header_row) and _clean_text(raw.iat[1, spacer_col]) and header_row[spacer_col : spacer_col + len(RISK_FREE_EXCEL_HEADERS)] != RISK_FREE_EXCEL_HEADERS:
+            _message(messages, "Warning", sheet, f"Expected a blank spacer column after price block starting at {get_column_letter(col + 1)}.")
 
     if not block_starts:
         _message(messages, "Error", sheet, "No valid Product/ISIN/Date/Price price blocks were found.")
@@ -362,6 +379,78 @@ def _parse_prices(raw: pd.DataFrame, messages: list[ValidationMessage]) -> pd.Da
             _message(messages, "Info", sheet, f"{asset_id} has price-history gaps up to {int(gaps.max())} days.")
 
     return out.sort_values(["asset_id", "date"]).reset_index(drop=True)
+
+
+def _parse_risk_free_rates(
+    raw: pd.DataFrame, messages: list[ValidationMessage]
+) -> pd.DataFrame:
+    """Parse the optional government-bond yield block from Historical Prices."""
+    sheet = SHEET_HISTORICAL_PRICES
+    if raw.shape[0] < 2:
+        _message(messages, "Warning", sheet, "No risk-free-rate block found. Risk-adjusted metrics use 0%.")
+        return _empty_risk_free_rates()
+
+    headers = [_clean_text(v) for v in raw.iloc[1].tolist()]
+    starts = [
+        col
+        for col in range(max(0, len(headers) - len(RISK_FREE_EXCEL_HEADERS) + 1))
+        if headers[col : col + len(RISK_FREE_EXCEL_HEADERS)] == RISK_FREE_EXCEL_HEADERS
+    ]
+    if not starts:
+        _message(messages, "Warning", sheet, "No risk-free-rate block found. Risk-adjusted metrics use 0%.")
+        return _empty_risk_free_rates()
+
+    start = starts[0]
+    group_header = _clean_text(raw.iat[0, start])
+    if group_header != RISK_FREE_GROUP_HEADER:
+        _message(
+            messages,
+            "Info",
+            sheet,
+            "Risk-free yields were detected from their header sequence (the group header is optional).",
+        )
+    if len(starts) > 1:
+        _message(messages, "Warning", sheet, "Multiple risk-free-rate blocks were found; only the first block is used.")
+
+    rows: list[dict] = []
+    yield_columns = RISK_FREE_COLUMNS[2:]
+    for row_idx in range(2, raw.shape[0]):
+        values = [raw.iat[row_idx, start + offset] if start + offset < raw.shape[1] else np.nan for offset in range(8)]
+        if all(pd.isna(value) or _clean_text(value) == "" for value in values):
+            continue
+        excel_row = row_idx + 1
+        year_value = pd.to_numeric(values[0], errors="coerce")
+        country = _clean_text(values[1])
+        if pd.isna(year_value) or int(year_value) != float(year_value):
+            _message(messages, "Error", sheet, "Risk-free-rate Year must be an integer.", [excel_row])
+            continue
+        if not country:
+            _message(messages, "Warning", sheet, "Risk-free-rate rows should include a Country.", [excel_row])
+
+        row = {"year": int(year_value), "country": country, "source_row": excel_row}
+        valid_yields = 0
+        for value, column, label in zip(values[2:], yield_columns, RISK_FREE_EXCEL_HEADERS[2:]):
+            parsed, interpreted = _parse_percent(value)
+            if pd.notna(parsed):
+                valid_yields += 1
+            elif not (pd.isna(value) or _clean_text(value) == ""):
+                _message(messages, "Error", sheet, f"Risk-free {label} must be numeric.", [excel_row])
+            if interpreted:
+                _message(messages, "Info", sheet, f"Interpreted {label} in row {excel_row} as a percentage.")
+            row[column] = parsed
+        if valid_yields == 0:
+            _message(messages, "Warning", sheet, "Risk-free-rate rows need at least one yield.", [excel_row])
+            continue
+        rows.append(row)
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        _message(messages, "Warning", sheet, "No usable risk-free-rate rows were found. Risk-adjusted metrics use 0%.")
+        return _empty_risk_free_rates()
+    duplicates = result.duplicated(subset=["year", "country"], keep=False)
+    _flag_rows(result, duplicates, messages, "Warning", sheet, "Duplicate risk-free rate rows were found; the last row is used.")
+    result = result.drop_duplicates(subset=["year", "country"], keep="last")
+    return result[RISK_FREE_COLUMNS].sort_values(["year", "country"]).reset_index(drop=True)
 
 
 def _parse_composition(raw: pd.DataFrame, messages: list[ValidationMessage]) -> pd.DataFrame:
@@ -600,11 +689,38 @@ def _build_prices_sheet(ws, include_examples: bool) -> None:
                 ws.cell(row_num, start + 1, isin)
                 ws.cell(row_num, start + 2, date)
                 ws.cell(row_num, start + 3, price)
+
+    risk_free_start = 16
+    ws.merge_cells(start_row=1, start_column=risk_free_start, end_row=1, end_column=risk_free_start + 7)
+    ws.cell(1, risk_free_start, RISK_FREE_GROUP_HEADER)
+    for offset, header in enumerate(RISK_FREE_EXCEL_HEADERS):
+        ws.cell(2, risk_free_start + offset, header)
+    if include_examples:
+        risk_free_rows = [
+            [2019, "Germany", -0.62, -0.60, -0.48, -0.19, 0.28, 0.37],
+            [2020, "Germany", -0.73, -0.74, -0.72, -0.57, -0.18, -0.17],
+            [2021, "Germany", -0.70, -0.62, -0.49, -0.18, 0.20, 0.34],
+            [2022, "Germany", 2.83, 2.60, 2.30, 2.10, 2.18, 2.13],
+            [2023, "Germany", 3.21, 2.57, 2.19, 2.02, 2.18, 2.10],
+        ]
+        for row_num, values in enumerate(risk_free_rows, start=3):
+            for offset, value in enumerate(values):
+                ws.cell(row_num, risk_free_start + offset, value / 100 if offset >= 2 else value)
     ws.freeze_panes = "A3"
-    _style_sheet(ws, max_col=14, percent_cols=[], date_cols=[3, 8, 13], money_cols=[4, 9, 14])
-    for col in range(1, 15):
+    _style_sheet(
+        ws,
+        max_col=23,
+        percent_cols=[18, 19, 20, 21, 22, 23],
+        date_cols=[3, 8, 13],
+        money_cols=[4, 9, 14],
+    )
+    for col in range(1, 16):
         ws.column_dimensions[get_column_letter(col)].width = 18 if col % 5 else 4
-    ws["A1"].comment = Comment("Add more assets by continuing the four-column Product/ISIN/Date/Price block plus one blank spacer column.", "Codex")
+    ws.column_dimensions["P"].width = 10
+    ws.column_dimensions["Q"].width = 16
+    for col in range(18, 24):
+        ws.column_dimensions[get_column_letter(col)].width = 13
+    ws["A1"].comment = Comment("Add more assets by continuing the four-column Product/ISIN/Date/Price block plus one blank spacer column. The optional government-bond block supplies risk-free rates for risk-adjusted metrics.", "Codex")
 
 
 def _build_composition_sheet(ws, include_examples: bool) -> None:

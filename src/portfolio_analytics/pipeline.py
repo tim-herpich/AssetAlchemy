@@ -11,8 +11,6 @@ def analyze_uploaded_workbook(file_bytes: bytes, settings: AnalysisSettings) -> 
     workbook = parse_workbook(BytesIO(file_bytes))
     analysis = build_analysis(
         workbook,
-        annual_risk_free_rate=settings.annual_risk_free_rate,
         forward_fill_prices=settings.forward_fill_prices,
     )
     return workbook, analysis
-

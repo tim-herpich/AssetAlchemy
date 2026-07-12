@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from io import BytesIO
+
 import pandas as pd
 import streamlit as st
 
 from portfolio_analytics.charts import (
     allocation_donut,
     annual_return_bar,
-    cash_flow_chart,
     correlation_heatmap,
     daily_returns_chart,
     drawdown_chart,
@@ -15,7 +16,6 @@ from portfolio_analytics.charts import (
     monthly_heatmap,
     portfolio_value_chart,
     position_value_chart,
-    price_history_chart,
     quantity_chart,
     return_distribution,
     risk_return_scatter,
@@ -28,8 +28,8 @@ from portfolio_analytics.charts import (
 from portfolio_analytics.engine import rebalance_with_new_cash
 from portfolio_analytics.exports import (
     build_analysis_workbook_bytes,
-    sample_template_bytes,
     to_csv_bytes,
+    to_xlsx_bytes,
 )
 from portfolio_analytics.models import (
     AnalysisSettings,
@@ -37,95 +37,168 @@ from portfolio_analytics.models import (
     PortfolioWorkbook,
 )
 from portfolio_analytics.pipeline import analyze_uploaded_workbook
-from portfolio_analytics.workbook import build_upload_template_bytes
+from portfolio_analytics.workbook import REQUIRED_SHEETS, build_upload_template_bytes
 
 from .design import inject_css
 from .formatting import fmt_eur, fmt_num, fmt_pct, ordered_columns
 
-NAV_ITEMS = [
-    "Portfolio Overview",
-    "Upload & Validation",
-    "Performance",
-    "Positions",
-    "Allocation & Rebalancing",
-    "Risk Metrics",
-    "Rolling Analysis",
-    "Transactions",
-    "Historical Prices",
-    "Export",
-]
-
 
 def render_app() -> None:
-    st.set_page_config(page_title="Portfolio Tracker", layout="wide")
+    st.set_page_config(page_title="Asset Alchemy", page_icon="◈", layout="wide")
     inject_css()
+    _initialize_session_state()
 
+    uploaded, analyze_clicked = _render_sidebar()
+    if uploaded is not None:
+        _register_upload(uploaded)
+    if analyze_clicked:
+        _run_analysis()
+
+    if st.session_state.uploaded_file is None:
+        _render_empty_state()
+        return
+
+    if not st.session_state.analysis_has_run:
+        _render_ready_state()
+        return
+
+    if st.session_state.analysis_error:
+        st.error("Analysis failed")
+        st.caption(st.session_state.analysis_error)
+        st.info("Check that the workbook is a valid .xlsx or .xlsm file, then upload it again.")
+        return
+
+    workbook = st.session_state.validation_results
+    analysis = st.session_state.analysis_results
+    if workbook is None or analysis is None:
+        st.warning("The workbook is ready, but analysis results are not available yet.")
+        return
+
+    _render_dashboard(workbook, analysis)
+
+
+def _initialize_session_state() -> None:
+    defaults = {
+        "uploaded_file": None,
+        "workbook_loaded": False,
+        "validation_results": None,
+        "analysis_has_run": False,
+        "analysis_results": None,
+        "analysis_error": None,
+        "selected_settings": {"forward_fill_prices": True},
+        "upload_signature": None,
+        "workbook_inspection": {"sheets": [], "error": None},
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def _render_sidebar():
     with st.sidebar:
-        st.title("Portfolio Tracker")
-        sidebar_upload = st.file_uploader(
-            "Workbook", type=["xlsx", "xlsm"], key="sidebar_upload"
-        )
+        st.markdown("<div class='brand-mark'>Asset Alchemy</div>", unsafe_allow_html=True)
+        st.caption("Upload your completed workbook, then run the analysis.")
         st.download_button(
-            "Blank template",
-            data=build_upload_template_bytes(include_examples=False),
-            file_name="portfolio_tracker_template.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-        st.download_button(
-            "Sample workbook",
-            data=sample_template_bytes(),
-            file_name="portfolio_tracker_sample.xlsx",
+            "Download prefilled template",
+            data=build_upload_template_bytes(include_examples=True),
+            file_name="asset_alchemy_template.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
         st.divider()
-        risk_free_rate = st.number_input(
-            "Annual risk-free rate", value=0.0, step=0.0025, format="%.4f"
+        uploaded = st.file_uploader(
+            "Upload completed template",
+            type=["xlsx", "xlsm"],
+            help="Use the three-sheet Asset Alchemy template. Drag a file here or browse to select it.",
+            key="workbook_upload",
         )
-        forward_fill_prices = st.toggle("Forward-fill prices", value=True)
+        st.caption("Accepted formats: .xlsx and .xlsm")
 
-    uploaded = sidebar_upload
-    if uploaded is None:
-        _render_start()
+        analyze_clicked = st.button(
+            "Analyze portfolio", type="primary", use_container_width=True
+        )
+        _render_analysis_status()
+
+        with st.expander("Settings", expanded=False):
+            st.session_state.selected_settings["forward_fill_prices"] = st.toggle(
+                "Forward-fill missing prices",
+                value=st.session_state.selected_settings["forward_fill_prices"],
+                help="Carries the latest available price forward between observations.",
+            )
+
+    return uploaded, analyze_clicked
+
+
+def _render_analysis_status() -> None:
+    if st.session_state.uploaded_file is None:
+        st.caption("Status · No workbook uploaded")
+    elif st.session_state.analysis_error:
+        st.caption("Status · Analysis failed")
+    elif st.session_state.analysis_has_run:
+        st.caption("Status · Analysis complete")
+    elif st.session_state.workbook_loaded:
+        st.caption("Status · Workbook uploaded, ready to analyze")
+    else:
+        st.caption("Status · Validating workbook")
+
+
+def _register_upload(uploaded) -> None:
+    file_bytes = uploaded.getvalue()
+    signature = (uploaded.name, len(file_bytes), hash(file_bytes))
+    if signature == st.session_state.upload_signature:
+        return
+    st.session_state.upload_signature = signature
+    st.session_state.uploaded_file = {
+        "name": uploaded.name,
+        "size": len(file_bytes),
+        "bytes": file_bytes,
+    }
+    st.session_state.workbook_inspection = _inspect_workbook(file_bytes)
+    st.session_state.workbook_loaded = True
+    st.session_state.validation_results = None
+    st.session_state.analysis_results = None
+    st.session_state.analysis_has_run = False
+    st.session_state.analysis_error = None
+
+
+@st.cache_data(show_spinner=False)
+def _inspect_workbook(file_bytes: bytes) -> dict[str, object]:
+    try:
+        sheets = pd.ExcelFile(BytesIO(file_bytes)).sheet_names
+        return {"sheets": sheets, "error": None}
+    except Exception as exc:  # pandas normalizes the details in the user-facing state
+        return {"sheets": [], "error": str(exc)}
+
+
+def _run_analysis() -> None:
+    upload = st.session_state.uploaded_file
+    if upload is None:
+        st.sidebar.warning("Upload a completed template before running analysis.")
         return
 
     settings = AnalysisSettings(
-        annual_risk_free_rate=risk_free_rate,
-        forward_fill_prices=forward_fill_prices,
+        forward_fill_prices=st.session_state.selected_settings["forward_fill_prices"]
     )
-    workbook, analysis = _load_workbook_and_analysis(uploaded.getvalue(), settings)
-
-    with st.sidebar:
-        st.divider()
-        page = st.radio("View", NAV_ITEMS, label_visibility="collapsed")
-        _render_validation_badge(workbook)
-
-    if workbook.has_errors and page != "Upload & Validation":
-        st.warning(
-            "Validation errors were found. Review Upload & Validation before relying on the analytics."
-        )
-
-    if page == "Portfolio Overview":
-        _render_overview(analysis, workbook)
-    elif page == "Upload & Validation":
-        _render_validation_page(workbook, analysis)
-    elif page == "Performance":
-        _render_performance(analysis)
-    elif page == "Positions":
-        _render_positions(analysis)
-    elif page == "Allocation & Rebalancing":
-        _render_allocation(analysis)
-    elif page == "Risk Metrics":
-        _render_risk(analysis)
-    elif page == "Rolling Analysis":
-        _render_rolling(analysis)
-    elif page == "Transactions":
-        _render_transactions(workbook, analysis)
-    elif page == "Historical Prices":
-        _render_prices(workbook)
-    elif page == "Export":
-        _render_export(workbook, analysis)
+    try:
+        with st.status("Analyzing portfolio", expanded=True) as status:
+            st.write("Reading workbook")
+            st.write("Validating template")
+            st.write("Parsing transactions")
+            st.write("Parsing historical prices")
+            st.write("Parsing portfolio composition")
+            workbook, analysis = _load_workbook_and_analysis(upload["bytes"], settings)
+            st.write("Building daily performance")
+            st.write("Computing risk and rolling metrics")
+            st.write("Preparing dashboard")
+            status.update(label="Analysis complete", state="complete", expanded=False)
+        st.session_state.validation_results = workbook
+        st.session_state.analysis_results = analysis
+        st.session_state.analysis_has_run = True
+        st.session_state.analysis_error = None
+    except Exception as exc:
+        st.session_state.validation_results = None
+        st.session_state.analysis_results = None
+        st.session_state.analysis_has_run = True
+        st.session_state.analysis_error = str(exc)
 
 
 @st.cache_data(show_spinner=False)
@@ -135,589 +208,414 @@ def _load_workbook_and_analysis(
     return analyze_uploaded_workbook(file_bytes, settings)
 
 
-def _render_start():
+def _render_empty_state() -> None:
+    st.markdown("<div class='eyebrow'>Portfolio intelligence</div>", unsafe_allow_html=True)
+    st.title("Asset Alchemy")
     st.markdown(
-        """
-        <div class="app-shell hero-grid">
-            <div>
-                <div class="section-kicker">Portfolio operations</div>
-                <h1 class="hero-title">Analyze the portfolio workbook as a living dashboard.</h1>
-                <p class="hero-copy">
-                    Upload a completed workbook and the app builds holdings, cash-flow adjusted performance,
-                    rolling windows, allocation drift, and rebalance suggestions from the workbook data.
-                </p>
-                <div class="status-row">
-                    <span class="status-pill"><span class="status-dot"></span>Ready for upload</span>
-                    <span class="status-pill"><span class="status-dot"></span>Dynamic asset universe</span>
-                    <span class="status-pill"><span class="status-dot"></span>EUR analytics</span>
-                </div>
-                <div class="contract-grid">
-                    <div class="contract-card">
-                        <h3>Transactions</h3>
-                        <p>Broker, product, ISIN, action, quantity, price, cash flow, and fees.</p>
-                    </div>
-                    <div class="contract-card">
-                        <h3>Historical Prices</h3>
-                        <p>Repeating Product / ISIN / Date / Price blocks for each asset.</p>
-                    </div>
-                    <div class="contract-card">
-                        <h3>Portfolio Composition</h3>
-                        <p>Yearly target weights and tolerance for drift and rebalancing.</p>
-                    </div>
-                </div>
-            </div>
-            <div class="start-panel">
-                <div class="start-panel-topline">Input ready</div>
-                <div class="start-panel-number">3</div>
-                <div class="start-panel-label">required workbook sheets</div>
-                <div class="start-panel-rule"></div>
-                <p>Use the sidebar controls to download a template or upload a completed workbook.</p>
-            </div>
-        </div>
-        """,
+        "<p class='lead'>Transform your workbook into portfolio intelligence.</p>",
         unsafe_allow_html=True,
     )
-    st.write("")
-    _render_static_preview()
-    return None
-
-
-def _render_static_preview() -> None:
-    st.markdown(
-        '<div class="section-kicker">What the dashboard will assemble</div>',
-        unsafe_allow_html=True,
+    st.write(
+        "Start with the prefilled template, add your own transactions, prices, and target allocation, then run a focused analysis when you are ready."
     )
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Performance path", "Daily", "Portfolio + assets")
-    c2.metric("Rolling windows", "Dynamic", "Only possible periods")
-    c3.metric("Allocation check", "Target aware", "Drift + tolerance")
-    c4.metric("Exports", "Workbook + CSV", "Clean outputs")
+    st.markdown("<div class='workflow'>", unsafe_allow_html=True)
+    columns = st.columns(3)
+    for column, number, title, detail in [
+        (columns[0], "01", "Download template", "Use the prefilled workbook as your starting point."),
+        (columns[1], "02", "Complete the data", "Fill transactions, prices, and composition."),
+        (columns[2], "03", "Upload and analyze", "Review the dashboard and export the results."),
+    ]:
+        with column:
+            st.markdown(
+                f"<div class='workflow-step'><span>{number}</span><h3>{title}</h3><p>{detail}</p></div>",
+                unsafe_allow_html=True,
+            )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
-def _render_validation_badge(workbook: PortfolioWorkbook) -> None:
-    frame = workbook.validation_frame()
-    counts = frame["severity"].value_counts().to_dict()
-    errors = int(counts.get("Error", 0))
-    warnings = int(counts.get("Warning", 0))
-    infos = int(counts.get("Info", 0))
-    if errors:
-        st.error(f"{errors} errors, {warnings} warnings")
-    elif warnings:
-        st.warning(f"{warnings} warnings, {infos} notes")
+def _render_ready_state() -> None:
+    upload = st.session_state.uploaded_file
+    inspection = st.session_state.workbook_inspection
+    st.markdown("<div class='eyebrow'>Workbook ready</div>", unsafe_allow_html=True)
+    st.title("Ready to analyze")
+    st.write("Your workbook is uploaded. Review the quick intake check, then select **Analyze portfolio** in the sidebar.")
+    c1, c2, c3 = st.columns([1.35, 0.8, 1.5])
+    c1.metric("File", upload["name"])
+    c2.metric("Size", _format_file_size(upload["size"]))
+    if inspection["error"]:
+        c3.metric("Workbook check", "Could not inspect")
+        st.warning("The workbook could not be inspected. You can still try analysis after checking the file format.")
+        return
+
+    detected = set(inspection["sheets"])
+    missing = [sheet for sheet in REQUIRED_SHEETS if sheet not in detected]
+    c3.metric("Required sheets", f"{len(REQUIRED_SHEETS) - len(missing)} / {len(REQUIRED_SHEETS)}")
+    if missing:
+        st.warning("Missing required sheets: " + ", ".join(missing))
     else:
-        st.success("Validation passed")
+        st.success("All required sheets detected. The workbook is ready for full validation.")
+    st.caption("Detected sheets: " + ", ".join(inspection["sheets"]))
 
 
-def _render_validation_page(
-    workbook: PortfolioWorkbook, analysis: PortfolioAnalysis
-) -> None:
-    st.markdown(
-        '<div class="section-kicker">Workbook intake</div>', unsafe_allow_html=True
+def _render_dashboard(workbook: PortfolioWorkbook, analysis: PortfolioAnalysis) -> None:
+    st.markdown("<div class='eyebrow'>Asset Alchemy</div>", unsafe_allow_html=True)
+    st.title("Portfolio intelligence")
+    if workbook.has_errors:
+        st.warning("Validation found errors. Review Data Quality before relying on the analytics.")
+    _render_risk_free_source(workbook)
+
+    tabs = st.tabs(
+        [
+            "Overview",
+            "Performance",
+            "Positions",
+            "Allocation",
+            "Risk",
+            "Rolling",
+            "Transactions",
+            "Data Quality",
+            "Export",
+        ]
     )
-    st.title("Upload & Validation")
-    frame = workbook.validation_frame()
-    counts = frame["severity"].value_counts().to_dict()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sheets", len(workbook.workbook_sheets))
-    c2.metric("Errors", int(counts.get("Error", 0)))
-    c3.metric("Warnings", int(counts.get("Warning", 0)))
-    c4.metric("Notes", int(counts.get("Info", 0)))
+    with tabs[0]:
+        _render_overview(analysis, workbook)
+    with tabs[1]:
+        _render_performance(analysis)
+    with tabs[2]:
+        _render_positions(analysis)
+    with tabs[3]:
+        _render_allocation(analysis)
+    with tabs[4]:
+        _render_risk(analysis)
+    with tabs[5]:
+        _render_rolling(analysis)
+    with tabs[6]:
+        _render_transactions(workbook, analysis)
+    with tabs[7]:
+        _render_data_quality(workbook, analysis)
+    with tabs[8]:
+        _render_export(workbook, analysis)
 
-    st.subheader("Validation Report")
-    _dataframe(frame, height=340)
 
-    st.subheader("Normalized Data")
-    t1, t2, t3, t4 = st.tabs(
-        ["Transactions", "Historical Prices", "Portfolio Composition", "Assets"]
-    )
-    with t1:
-        _dataframe(workbook.transactions, height=360)
-    with t2:
-        _dataframe(workbook.prices, height=360)
-    with t3:
-        _dataframe(workbook.composition, height=360)
-    with t4:
-        _dataframe(analysis.asset_master, height=360)
+def _render_risk_free_source(workbook: PortfolioWorkbook) -> None:
+    if workbook.risk_free_rates.empty:
+        st.caption("Risk-free rates: not found, using 0% fallback.")
+    else:
+        countries = workbook.risk_free_rates["country"].replace("", pd.NA).dropna().unique()
+        suffix = f" ({', '.join(countries[:2])})" if len(countries) else ""
+        st.caption(
+            "Risk-free rates: parsed from Historical Prices → Risk-Free Government Bonds" + suffix
+        )
 
 
 def _render_overview(analysis: PortfolioAnalysis, workbook: PortfolioWorkbook) -> None:
-    metrics = analysis.metrics
-    st.markdown('<div class="section-kicker">Dashboard</div>', unsafe_allow_html=True)
-    st.title("Portfolio Overview")
-
     if analysis.daily_portfolio.empty:
-        st.error("Portfolio value cannot be computed from the uploaded workbook.")
-        _render_validation_page(workbook, analysis)
+        st.error("Portfolio value could not be computed from the uploaded workbook.")
+        _render_data_quality(workbook, analysis)
         return
-
-    latest_date = analysis.daily_portfolio["date"].max()
-    first_date = analysis.daily_portfolio["date"].min()
+    metrics = analysis.metrics
+    st.subheader("Overview", anchor=False)
     _summary_metrics(metrics)
-    _overview_insights(analysis, workbook, first_date, latest_date)
-
-    c1, c2 = st.columns([1.7, 1])
+    c1, c2 = st.columns([1.65, 1])
     with c1:
-        st.plotly_chart(
-            portfolio_value_chart(analysis.daily_portfolio), use_container_width=True
-        )
+        st.plotly_chart(portfolio_value_chart(analysis.daily_portfolio), use_container_width=True)
     with c2:
         st.plotly_chart(
-            allocation_donut(
-                analysis.allocation, "current_value_eur", "Current Allocation"
-            ),
+            allocation_donut(analysis.allocation, "current_value_eur", "Current allocation"),
             use_container_width=True,
         )
-
-    c3, c4 = st.columns([1.2, 1])
-    with c3:
-        st.plotly_chart(twr_chart(analysis.daily_portfolio), use_container_width=True)
-    with c4:
-        st.plotly_chart(
-            drawdown_chart(analysis.daily_portfolio), use_container_width=True
-        )
-
-    st.subheader("Portfolio Health")
-    h1, h2 = st.columns([1.2, 1])
-    with h1:
-        watchlist = ordered_columns(
-            analysis.allocation,
-            [
-                "product",
-                "actual_weight",
-                "target_weight",
-                "drift",
-                "tolerance",
-                "out_of_tolerance",
-                "rebalance_amount_eur",
-            ],
-        )
-        _dataframe(watchlist, height=300)
-    with h2:
-        st.plotly_chart(
-            cash_flow_chart(analysis.daily_portfolio), use_container_width=True
-        )
+    _overview_insights(analysis, workbook)
 
 
-def _overview_insights(
-    analysis: PortfolioAnalysis,
-    workbook: PortfolioWorkbook,
-    first_date: pd.Timestamp,
-    latest_date: pd.Timestamp,
-) -> None:
-    frame = workbook.validation_frame()
-    counts = frame["severity"].value_counts().to_dict()
-    out_of_tolerance = (
-        int(analysis.allocation["out_of_tolerance"].sum())
-        if not analysis.allocation.empty
-        else 0
-    )
-    active_positions = (
-        int((analysis.holdings["value_eur"] > 0).sum())
-        if not analysis.holdings.empty
-        else 0
-    )
-    observations = int(len(analysis.daily_portfolio))
-    validation_text = (
-        "Clean"
-        if int(counts.get("Error", 0)) == 0 and int(counts.get("Warning", 0)) == 0
-        else f"{int(counts.get('Error', 0))} errors / {int(counts.get('Warning', 0))} warnings"
-    )
+def _summary_metrics(metrics: dict[str, float]) -> None:
+    columns = st.columns(6)
+    values = [
+        ("Portfolio value", fmt_eur(metrics.get("portfolio_value_eur"))),
+        ("Total invested", fmt_eur(metrics.get("total_invested_eur"))),
+        ("Total return", fmt_eur(metrics.get("total_return_eur"))),
+        ("Total return %", fmt_pct(metrics.get("total_return_pct"))),
+        ("Time-weighted return", fmt_pct(metrics.get("twr"))),
+        ("Current drawdown", fmt_pct(metrics.get("current_drawdown"))),
+    ]
+    for column, (label, value) in zip(columns, values):
+        column.metric(label, value)
 
-    st.markdown(
-        f"""
-        <div class="insight-grid">
-            <div class="insight-card">
-                <div class="small-label">Analysis date</div>
-                <div class="big-value">{latest_date:%Y-%m-%d}</div>
-                <p>From {first_date:%Y-%m-%d}</p>
-            </div>
-            <div class="insight-card">
-                <div class="small-label">Active positions</div>
-                <div class="big-value">{active_positions}</div>
-                <p>{analysis.asset_master.shape[0]} assets detected</p>
-            </div>
-            <div class="insight-card">
-                <div class="small-label">Daily rows</div>
-                <div class="big-value">{observations:,}</div>
-                <p>Portfolio performance observations</p>
-            </div>
-            <div class="insight-card">
-                <div class="small-label">Validation</div>
-                <div class="big-value">{validation_text}</div>
-                <p>{out_of_tolerance} allocation lines outside tolerance</p>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+
+def _overview_insights(analysis: PortfolioAnalysis, workbook: PortfolioWorkbook) -> None:
+    best_asset = "—"
+    if not analysis.risk_by_asset.empty:
+        row = analysis.risk_by_asset.sort_values("twr", ascending=False).iloc[0]
+        best_asset = f"{row['product']} · {fmt_pct(row['twr'])}"
+    largest_position = "—"
+    highest_drift = "—"
+    if not analysis.allocation.empty:
+        largest = analysis.allocation.sort_values("current_value_eur", ascending=False).iloc[0]
+        drift = analysis.allocation.sort_values("absolute_drift", ascending=False).iloc[0]
+        largest_position = f"{largest['product']} · {fmt_pct(largest['actual_weight'])}"
+        highest_drift = f"{drift['product']} · {fmt_pct(drift['drift'])}"
+    risk_free = "Workbook block" if not workbook.risk_free_rates.empty else "0% fallback"
+    items = [
+        ("Best performing asset", best_asset),
+        ("Largest position", largest_position),
+        ("Highest drift from target", highest_drift),
+        ("Total fees", fmt_eur(analysis.metrics.get("total_fees_eur"))),
+        ("Risk-free source", risk_free),
+    ]
+    st.markdown("<div class='section-label'>At a glance</div>", unsafe_allow_html=True)
+    columns = st.columns(5)
+    for column, (label, value) in zip(columns, items):
+        column.metric(label, value)
 
 
 def _render_performance(analysis: PortfolioAnalysis) -> None:
-    st.markdown('<div class="section-kicker">Returns</div>', unsafe_allow_html=True)
-    st.title("Performance")
+    st.subheader("Performance", anchor=False)
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(
-            daily_returns_chart(analysis.daily_portfolio), use_container_width=True
-        )
+        st.plotly_chart(portfolio_value_chart(analysis.daily_portfolio), use_container_width=True)
     with c2:
-        st.plotly_chart(
-            monthly_heatmap(analysis.monthly_returns), use_container_width=True
-        )
-    st.plotly_chart(annual_return_bar(analysis.annual), use_container_width=True)
-
-    t1, t2 = st.tabs(["Annual Metrics", "Daily Portfolio"])
-    with t1:
-        _dataframe(
-            ordered_columns(
-                analysis.annual,
-                [
-                    "year",
-                    "end_value_eur",
-                    "invested_eur",
-                    "return_eur",
-                    "twr",
-                    "annualized_volatility",
-                    "sharpe_ratio",
-                    "max_drawdown",
-                    "win_rate",
-                ],
-            ),
-            height=360,
-        )
-    with t2:
-        _dataframe(analysis.daily_portfolio.tail(500), height=420)
+        st.plotly_chart(twr_chart(analysis.daily_portfolio), use_container_width=True)
+    c3, c4 = st.columns(2)
+    with c3:
+        st.plotly_chart(annual_return_bar(analysis.annual), use_container_width=True)
+    with c4:
+        st.plotly_chart(monthly_heatmap(analysis.monthly_returns), use_container_width=True)
+    st.plotly_chart(daily_returns_chart(analysis.daily_portfolio), use_container_width=True)
+    st.markdown("<div class='section-label'>Annual performance</div>", unsafe_allow_html=True)
+    _dataframe(
+        ordered_columns(
+            analysis.annual,
+            [
+                "year", "end_value_eur", "invested_eur", "return_eur", "twr",
+                "risk_free_rate", "annualized_volatility", "sharpe_ratio", "max_drawdown", "win_rate",
+            ],
+        ),
+        height=340,
+    )
 
 
 def _render_positions(analysis: PortfolioAnalysis) -> None:
-    st.markdown('<div class="section-kicker">Holdings</div>', unsafe_allow_html=True)
-    st.title("Positions")
-    c1, c2 = st.columns([2, 1])
+    st.subheader("Positions", anchor=False)
+    options = sorted(analysis.daily_asset["product"].dropna().unique()) if not analysis.daily_asset.empty else []
+    selected = st.multiselect("Assets", options, default=options, key="positions_assets")
+    data = analysis.daily_asset[analysis.daily_asset["product"].isin(selected)].copy()
+    c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(
-            position_value_chart(analysis.daily_asset), use_container_width=True
-        )
+        st.plotly_chart(position_value_chart(data), use_container_width=True)
     with c2:
-        st.plotly_chart(
-            allocation_donut(
-                analysis.allocation, "current_value_eur", "Current Allocation"
-            ),
-            use_container_width=True,
-        )
-
-    c3, c4 = st.columns(2)
-    with c3:
-        st.plotly_chart(quantity_chart(analysis.daily_asset), use_container_width=True)
-    with c4:
-        st.plotly_chart(
-            weights_area_chart(analysis.daily_asset), use_container_width=True
-        )
-
-    st.subheader("Position Snapshot")
-    _dataframe(_format_holdings_table(analysis.holdings), height=380)
+        st.plotly_chart(weights_area_chart(data), use_container_width=True)
+    st.plotly_chart(quantity_chart(data), use_container_width=True)
+    st.markdown("<div class='section-label'>Position performance</div>", unsafe_allow_html=True)
+    _dataframe(_format_holdings_table(analysis.holdings), height=360)
 
 
 def _render_allocation(analysis: PortfolioAnalysis) -> None:
-    st.markdown('<div class="section-kicker">Targets</div>', unsafe_allow_html=True)
-    st.title("Allocation & Rebalancing")
+    st.subheader("Allocation", anchor=False)
     new_cash = st.number_input(
-        "New cash to invest", min_value=0.0, value=0.0, step=100.0
+        "New cash to invest", min_value=0.0, value=0.0, step=100.0, key="allocation_new_cash"
     )
     allocation = rebalance_with_new_cash(analysis.allocation, new_cash)
-
+    out_of_tolerance = allocation[allocation["out_of_tolerance"]] if not allocation.empty else allocation
+    if not out_of_tolerance.empty:
+        st.warning(f"{len(out_of_tolerance)} position(s) are outside the workbook tolerance.")
     c1, c2 = st.columns(2)
     with c1:
         st.plotly_chart(
-            allocation_donut(allocation, "current_value_eur", "Actual Allocation"),
+            allocation_donut(allocation, "current_value_eur", "Current actual allocation"),
             use_container_width=True,
         )
     with c2:
-        target_plot = allocation.copy()
-        target_plot["target_value_for_chart"] = target_plot["target_weight"].clip(
-            lower=0.0
-        )
-        st.plotly_chart(
-            allocation_donut(
-                target_plot, "target_value_for_chart", "Target Allocation"
-            ),
-            use_container_width=True,
-        )
-
-    c3, c4 = st.columns(2)
-    with c3:
         st.plotly_chart(target_actual_bar(allocation), use_container_width=True)
-    with c4:
-        st.plotly_chart(drift_bar(allocation), use_container_width=True)
-
-    if new_cash > 0:
-        st.subheader("New-Cash Deployment")
-        _dataframe(
-            ordered_columns(
-                allocation,
-                [
-                    "product",
-                    "actual_weight",
-                    "target_weight",
-                    "drift",
-                    "current_value_eur",
-                    "new_cash_buy_eur",
-                ],
-            ),
-            height=360,
-        )
-    else:
-        st.subheader("Trade Existing Portfolio")
-        _dataframe(
-            ordered_columns(
-                allocation,
-                [
-                    "product",
-                    "actual_weight",
-                    "target_weight",
-                    "drift",
-                    "tolerance",
-                    "out_of_tolerance",
-                    "current_value_eur",
-                    "rebalance_amount_eur",
-                ],
-            ),
-            height=360,
-        )
+    st.plotly_chart(drift_bar(allocation), use_container_width=True)
+    st.markdown("<div class='section-label'>Rebalance suggestions</div>", unsafe_allow_html=True)
+    columns = [
+        "product", "actual_weight", "target_weight", "drift", "tolerance", "out_of_tolerance",
+        "current_value_eur", "rebalance_amount_eur", "new_cash_buy_eur",
+    ]
+    _dataframe(ordered_columns(allocation, columns), height=380)
 
 
 def _render_risk(analysis: PortfolioAnalysis) -> None:
-    st.markdown('<div class="section-kicker">Risk</div>', unsafe_allow_html=True)
-    st.title("Risk Metrics")
+    st.subheader("Risk", anchor=False)
     metrics = analysis.metrics
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Annual vol", fmt_pct(metrics.get("annualized_volatility")))
-    c2.metric("Sharpe", fmt_num(metrics.get("sharpe_ratio")))
-    c3.metric("Sortino", fmt_num(metrics.get("sortino_ratio")))
-    c4.metric("VaR 95%", fmt_pct(metrics.get("value_at_risk_95")))
-    c5.metric("CVaR 95%", fmt_pct(metrics.get("conditional_var_95")))
-
-    c6, c7 = st.columns(2)
-    with c6:
-        st.plotly_chart(
-            drawdown_chart(analysis.daily_portfolio), use_container_width=True
-        )
-    with c7:
-        st.plotly_chart(
-            return_distribution(
-                analysis.daily_portfolio, metrics.get("value_at_risk_95")
-            ),
-            use_container_width=True,
-        )
-
-    c8, c9 = st.columns(2)
-    with c8:
-        st.plotly_chart(
-            correlation_heatmap(analysis.correlation), use_container_width=True
-        )
-    with c9:
-        st.plotly_chart(
-            risk_return_scatter(analysis.risk_by_asset), use_container_width=True
-        )
-
-    st.subheader("Diversification")
-    d = analysis.diversification
-    d1, d2, d3, d4, d5 = st.columns(5)
-    d1.metric("Effective positions", fmt_num(d.get("effective_positions")))
-    d2.metric("HHI", fmt_num(d.get("hhi")))
-    d3.metric("Largest weight", fmt_pct(d.get("largest_weight")))
-    d4.metric("Top 3 weight", fmt_pct(d.get("top3_weight")))
-    d5.metric("Avg correlation", fmt_num(d.get("average_correlation")))
-
-    st.subheader("Asset Risk")
-    _dataframe(analysis.risk_by_asset, height=340)
+    columns = st.columns(6)
+    values = [
+        ("Annual volatility", fmt_pct(metrics.get("annualized_volatility"))),
+        ("Sharpe ratio", fmt_num(metrics.get("sharpe_ratio"))),
+        ("Sortino ratio", fmt_num(metrics.get("sortino_ratio"))),
+        ("Calmar ratio", fmt_num(metrics.get("calmar_ratio"))),
+        ("Maximum drawdown", fmt_pct(metrics.get("max_drawdown"))),
+        ("VaR / CVaR 95%", f"{fmt_pct(metrics.get('value_at_risk_95'))} / {fmt_pct(metrics.get('conditional_var_95'))}"),
+    ]
+    for column, (label, value) in zip(columns, values):
+        column.metric(label, value)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.plotly_chart(drawdown_chart(analysis.daily_portfolio), use_container_width=True)
+    with c2:
+        st.plotly_chart(return_distribution(analysis.daily_portfolio, metrics.get("value_at_risk_95")), use_container_width=True)
+    c3, c4 = st.columns(2)
+    with c3:
+        st.plotly_chart(correlation_heatmap(analysis.correlation), use_container_width=True)
+    with c4:
+        st.plotly_chart(risk_return_scatter(analysis.risk_by_asset), use_container_width=True)
+    diversification = analysis.diversification
+    st.markdown("<div class='section-label'>Concentration</div>", unsafe_allow_html=True)
+    concentration = st.columns(4)
+    concentration[0].metric("Herfindahl-Hirschman Index", fmt_num(diversification.get("hhi")))
+    concentration[1].metric("Inverse HHI", fmt_num(diversification.get("effective_positions")))
+    concentration[2].metric("Effective positions", fmt_num(diversification.get("effective_positions")))
+    concentration[3].metric("Top position concentration", fmt_pct(diversification.get("largest_weight")))
+    _dataframe(analysis.risk_by_asset, height=300)
 
 
 def _render_rolling(analysis: PortfolioAnalysis) -> None:
-    st.markdown('<div class="section-kicker">Windows</div>', unsafe_allow_html=True)
-    st.title("Rolling Analysis")
+    st.subheader("Rolling analysis", anchor=False)
     c1, c2 = st.columns(2)
     with c1:
-        st.plotly_chart(
-            rolling_metric_chart(
-                analysis.rolling, "annualized_twr", "Rolling Annualized TWR"
-            ),
-            use_container_width=True,
-        )
+        st.plotly_chart(rolling_metric_chart(analysis.rolling, "annualized_twr", "Rolling annualized TWR"), use_container_width=True)
     with c2:
-        st.plotly_chart(
-            rolling_metric_chart(
-                analysis.rolling,
-                "annualized_volatility",
-                "Rolling Annualized Volatility",
-            ),
-            use_container_width=True,
-        )
+        st.plotly_chart(rolling_metric_chart(analysis.rolling, "sharpe_ratio", "Rolling Sharpe ratio"), use_container_width=True)
     c3, c4 = st.columns(2)
     with c3:
-        st.plotly_chart(
-            rolling_metric_chart(
-                analysis.rolling, "sharpe_ratio", "Rolling Sharpe Ratio"
-            ),
-            use_container_width=True,
-        )
+        st.plotly_chart(rolling_metric_chart(analysis.rolling, "annualized_volatility", "Rolling annualized volatility"), use_container_width=True)
     with c4:
-        st.plotly_chart(
-            rolling_metric_chart(
-                analysis.rolling, "max_drawdown", "Rolling Max Drawdown"
-            ),
-            use_container_width=True,
-        )
-
-    st.subheader("Rolling Periods")
+        st.plotly_chart(rolling_metric_chart(analysis.rolling, "max_drawdown", "Rolling maximum drawdown"), use_container_width=True)
+    st.caption("Only calendar-year windows supported by the uploaded history are shown.")
     _dataframe(
         ordered_columns(
             analysis.rolling,
             [
-                "period",
-                "period_years",
-                "trading_days",
-                "end_value_eur",
-                "invested_eur",
-                "period_twr",
-                "annualized_twr",
-                "annualized_volatility",
-                "sharpe_ratio",
-                "sortino_ratio",
-                "max_drawdown",
-                "win_rate",
+                "period", "start_year", "end_year", "trading_days", "start_value_eur", "end_value_eur",
+                "invested_eur", "return_eur", "period_twr", "annualized_twr", "risk_free_rate",
+                "period_volatility", "annualized_volatility", "sharpe_ratio", "sortino_ratio",
+                "max_drawdown", "calmar_ratio", "best_day", "worst_day", "win_rate",
+                "end_allocation_weights", "allocation_drift",
             ],
         ),
         height=460,
     )
 
 
-def _render_transactions(
-    workbook: PortfolioWorkbook, analysis: PortfolioAnalysis
-) -> None:
-    st.markdown('<div class="section-kicker">Activity</div>', unsafe_allow_html=True)
-    st.title("Transactions")
-    tx = workbook.transactions
+def _render_transactions(workbook: PortfolioWorkbook, analysis: PortfolioAnalysis) -> None:
+    st.subheader("Transactions", anchor=False)
+    tx = workbook.transactions.copy()
+    if tx.empty:
+        st.info("No transactions were parsed from the workbook.")
+        return
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Transactions", len(tx))
-    c2.metric("Buys", int((tx["action"] == "Buy").sum()) if not tx.empty else 0)
-    c3.metric("Sells", int((tx["action"] == "Sell").sum()) if not tx.empty else 0)
-    c4.metric("Fees", fmt_eur(tx["fee_eur"].sum()) if not tx.empty else fmt_eur(0))
-
+    c1.metric("Total buys", int(tx["action"].eq("Buy").sum()))
+    c2.metric("Total sells", int(tx["action"].eq("Sell").sum()))
+    c3.metric("Total fees", fmt_eur(tx["fee_eur"].sum()))
+    c4.metric("Transactions", len(tx))
+    filters = st.columns(4)
+    brokers = filters[0].multiselect("Broker", sorted(tx["broker"].dropna().unique()), key="tx_brokers")
+    assets = filters[1].multiselect("Asset", sorted(tx["product"].dropna().unique()), key="tx_assets")
+    actions = filters[2].multiselect("Action", sorted(tx["action"].dropna().unique()), key="tx_actions")
+    dates = filters[3].date_input("Date range", value=(tx["date"].min().date(), tx["date"].max().date()), key="tx_dates")
+    if brokers:
+        tx = tx[tx["broker"].isin(brokers)]
+    if assets:
+        tx = tx[tx["product"].isin(assets)]
+    if actions:
+        tx = tx[tx["action"].isin(actions)]
+    if isinstance(dates, tuple) and len(dates) == 2:
+        tx = tx[tx["date"].between(pd.Timestamp(dates[0]), pd.Timestamp(dates[1]))]
     st.plotly_chart(transaction_timeline(tx), use_container_width=True)
     c5, c6 = st.columns(2)
     with c5:
-        st.plotly_chart(
-            fees_bar(analysis.fees_by_broker, "broker", "Fees by Broker"),
-            use_container_width=True,
-        )
+        st.plotly_chart(fees_bar(analysis.fees_by_broker, "broker", "Fees by broker"), use_container_width=True)
     with c6:
-        st.plotly_chart(
-            fees_bar(analysis.fees_by_asset, "product", "Fees by Asset"),
-            use_container_width=True,
-        )
-
-    t1, t2 = st.tabs(["Transaction Table", "Action Summary"])
-    with t1:
-        _dataframe(tx.sort_values("date", ascending=False), height=460)
-    with t2:
-        _dataframe(analysis.transaction_summary, height=300)
+        st.plotly_chart(fees_bar(analysis.fees_by_asset, "product", "Fees by asset"), use_container_width=True)
+    _dataframe(tx.sort_values("date", ascending=False), height=440)
 
 
-def _render_prices(workbook: PortfolioWorkbook) -> None:
-    st.markdown('<div class="section-kicker">Market data</div>', unsafe_allow_html=True)
-    st.title("Historical Prices")
-    prices = workbook.prices
-    st.plotly_chart(price_history_chart(prices), use_container_width=True)
-    if prices.empty:
-        st.info("No historical price rows were parsed.")
-        return
-    coverage = (
-        prices.groupby(["asset_id", "product"], as_index=False)
-        .agg(
-            first_date=("date", "min"),
-            last_date=("date", "max"),
-            observations=("price", "size"),
-            min_price=("price", "min"),
-            max_price=("price", "max"),
-        )
-        .sort_values("product")
-    )
-    st.subheader("Coverage by Asset")
-    _dataframe(coverage, height=300)
-    st.subheader("Normalized Price Rows")
-    _dataframe(prices, height=440)
+def _render_data_quality(workbook: PortfolioWorkbook, analysis: PortfolioAnalysis) -> None:
+    st.subheader("Data quality", anchor=False)
+    report = workbook.validation_frame()
+    counts = report["severity"].value_counts().to_dict()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Errors", int(counts.get("Error", 0)))
+    c2.metric("Warnings", int(counts.get("Warning", 0)))
+    c3.metric("Info", int(counts.get("Info", 0)))
+    for severity in ["Error", "Warning", "Info"]:
+        findings = report[report["severity"].eq(severity)]
+        if not findings.empty:
+            with st.expander(f"{severity} · {len(findings)}", expanded=severity == "Error"):
+                _dataframe(findings, height=min(320, 90 + 42 * len(findings)))
+    with st.expander("Normalized workbook data"):
+        tabs = st.tabs(["Transactions", "Prices", "Composition", "Risk-free rates", "Assets"])
+        with tabs[0]:
+            _dataframe(workbook.transactions, height=320)
+        with tabs[1]:
+            _dataframe(workbook.prices, height=320)
+        with tabs[2]:
+            _dataframe(workbook.composition, height=320)
+        with tabs[3]:
+            _dataframe(workbook.risk_free_rates, height=240)
+        with tabs[4]:
+            _dataframe(analysis.asset_master, height=320)
 
 
 def _render_export(workbook: PortfolioWorkbook, analysis: PortfolioAnalysis) -> None:
-    st.markdown('<div class="section-kicker">Outputs</div>', unsafe_allow_html=True)
-    st.title("Export")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            "Download complete analysis workbook",
-            data=build_analysis_workbook_bytes(workbook, analysis),
-            file_name="portfolio_analysis_export.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    with c2:
-        st.download_button(
-            "Download clean input template",
-            data=build_upload_template_bytes(include_examples=False),
-            file_name="portfolio_tracker_template.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
+    st.subheader("Export", anchor=False)
+    st.download_button(
+        "Download prefilled template",
+        data=build_upload_template_bytes(include_examples=True),
+        file_name="asset_alchemy_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=False,
+    )
+    st.download_button(
+        "Download full analysis workbook",
+        data=build_analysis_workbook_bytes(workbook, analysis),
+        file_name="asset_alchemy_analysis.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=False,
+    )
     exports = [
-        ("daily_portfolio.csv", analysis.daily_portfolio),
-        ("daily_positions.csv", analysis.daily_asset),
-        ("annual_performance.csv", analysis.annual),
-        ("rolling_performance.csv", analysis.rolling),
-        ("allocation_rebalancing.csv", analysis.allocation),
-        ("validation_report.csv", workbook.validation_frame()),
+        ("Daily performance", "daily_performance", analysis.daily_portfolio),
+        ("Position performance", "position_performance", analysis.daily_asset),
+        ("Annual performance", "annual_performance", analysis.annual),
+        ("Rolling performance", "rolling_performance", analysis.rolling),
+        ("Allocation and rebalancing", "allocation_rebalancing", analysis.allocation),
+        ("Data quality report", "data_quality_report", workbook.validation_frame()),
     ]
-    st.subheader("CSV Downloads")
-    cols = st.columns(3)
-    for idx, (filename, df) in enumerate(exports):
-        with cols[idx % 3]:
-            st.download_button(
-                filename,
-                data=to_csv_bytes(df),
-                file_name=filename,
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-
-def _summary_metrics(metrics: dict[str, float]) -> None:
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Portfolio value", fmt_eur(metrics.get("portfolio_value_eur")))
-    c2.metric("Invested capital", fmt_eur(metrics.get("total_invested_eur")))
-    c3.metric("Total return", fmt_eur(metrics.get("total_return_eur")))
-    c4.metric("TWR", fmt_pct(metrics.get("twr")))
-    c5.metric("MWR", fmt_pct(metrics.get("money_weighted_return")))
-    c6.metric("Max drawdown", fmt_pct(metrics.get("max_drawdown")))
+    st.markdown("<div class='section-label'>Data exports</div>", unsafe_allow_html=True)
+    for label, stem, frame in exports:
+        c1, c2 = st.columns([1, 1])
+        c1.download_button(
+            f"{label} · CSV",
+            data=to_csv_bytes(frame),
+            file_name=f"{stem}.csv",
+            mime="text/csv",
+            key=f"{stem}_csv",
+            use_container_width=True,
+        )
+        c2.download_button(
+            f"{label} · XLSX",
+            data=to_xlsx_bytes(frame, label),
+            file_name=f"{stem}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{stem}_xlsx",
+            use_container_width=True,
+        )
 
 
 def _format_holdings_table(df: pd.DataFrame) -> pd.DataFrame:
     return ordered_columns(
         df,
         [
-            "product",
-            "isin",
-            "quantity",
-            "price",
-            "value_eur",
-            "weight",
-            "average_price_eur",
-            "total_investment_eur",
-            "total_fees_eur",
-            "total_return_eur",
-            "twr",
+            "product", "isin", "quantity", "price", "value_eur", "weight",
+            "average_price_eur", "total_investment_eur", "total_fees_eur", "total_return_eur", "twr",
         ],
     )
 
 
 def _dataframe(df: pd.DataFrame, height: int = 320) -> None:
     st.dataframe(df, use_container_width=True, height=height, hide_index=True)
+
+
+def _format_file_size(size: int) -> str:
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
